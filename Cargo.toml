@@ -9,6 +9,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[patch.crates-io]
+midir = { git = "https://github.com/yath/midir", branch = "direct-output-0.8.0" }
+
 [dependencies]
 byteorder = "1.4.3"
 clap = { version = "4.0.32", features = ["derive"] }
