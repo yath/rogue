@@ -74,7 +74,7 @@ fn do_probe(
                 continue;
             }
             Some(info) => {
-                println!(">>> {:?} [ {} ]", module, info);
+                println!("\n>>> {:?} [ {} ]", module, info);
                 info
             }
         };
