@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use log::{error, info, warn, LevelFilter};
+use log::{debug, error, info, warn, LevelFilter};
 use rogue::UserModuleType;
 use simple_logger::SimpleLogger;
 use std::path::{Path, PathBuf};
@@ -226,7 +226,7 @@ fn main() -> Result<()> {
 
     let mut dev = rogue::get_logue_device(&args.input_device, &args.output_device)?;
     let did = dev.identify()?;
-    info!("Device identifies as: {:x?}", did);
+    debug!("Device identifies as: {:x?}", did);
 
     let ret = match args.commands {
         Commands::Probe => do_probe(&mut dev, &did, args.module_type),
