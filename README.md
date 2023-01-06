@@ -34,7 +34,7 @@ Options that apply to all commands are:
 
 All subcommands except `check` can be restricted to a specific module type with
 `-m` and potentially a slot with `-s`. Accepted module types parameters are the
-ones recognized by `logue-cli` (`modfx`, delfx`, `revxf`, `osc`), but also the
+ones recognized by `logue-cli` (`modfx`, `delfx`, `revxf`, `osc`), but also the
 short versions `mod`, `del`, `rev` and `osc` or spelled out as `Oscillator`,
 `Delay`, `Modulation` and `Reverb`.
 
