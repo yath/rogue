@@ -11,6 +11,14 @@ struct Cli {
     #[arg(short = 'd', long, global = true)]
     debug: bool,
 
+    /// Input device name or number
+    #[arg(short = 'i', long, global = true)]
+    input_device: Option<String>,
+
+    /// Output device name or number
+    #[arg(short = 'o', long, global = true)]
+    output_device: Option<String>,
+
     /// Module type (modfx, delfx, revfx, osc)
     #[arg(short = 'm', long, global = true)]
     module_type: Option<rogue::UserModuleType>,
@@ -216,7 +224,7 @@ fn main() -> Result<()> {
         .env()
         .init()?;
 
-    let mut dev = rogue::get_logue_device()?;
+    let mut dev = rogue::get_logue_device(&args.input_device, &args.output_device)?;
     let did = dev.identify()?;
     info!("Device identifies as: {:x?}", did);
 

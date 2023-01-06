@@ -107,43 +107,68 @@ fn check_empty(mut c: io::Cursor<&[u8]>) -> Result<()> {
     }
 }
 
-fn get_matching_device<T: MidiIO>(io: &T) -> Result<T::Port> {
-    let all_ports = io.ports();
-    let mut matching_ports = all_ports
+fn get_matching_device<T: MidiIO>(
+    t: &str,
+    io: &T,
+    name_or_index: &Option<String>,
+) -> Result<T::Port> {
+    let known_prefixes = vec!["prologue", "prol.dev", "minilogue", "nutekt", "NTS-1"];
+
+    let mut matching_ports = io
+        .ports()
         .into_iter()
-        .filter(|port| match io.port_name(port) {
-            // FIXME match port properly
-            Ok(p) => p.starts_with("NTS-1"),
+        .enumerate()
+        .filter(|(index, port)| match io.port_name(port) {
             Err(e) => {
-                eprintln!("Error looking up port: {}", e);
+                eprintln!("Error looking up {} port: {}", t, e);
                 false
             }
+            Ok(p) => match name_or_index {
+                Some(x) => p == *x || index.to_string() == *x,
+                None => known_prefixes.iter().any(|prefix| p.starts_with(prefix)),
+            },
         })
+        .map(|(_, port)| port)
         .collect::<Vec<T::Port>>();
 
-    match matching_ports.len() {
+    let ret = match matching_ports.len() {
         0 => DeviceDiscoveryContext {
-            message: "no matching device found",
+            message: format!("no matching {} device found", t),
         }
         .fail(),
         1 => Ok(matching_ports.swap_remove(0)),
         _ => DeviceDiscoveryContext {
-            message: "more than one matching device found",
+            message: format!("more than one matching {} device found", t),
         }
         .fail(),
+    };
+
+    if ret.is_err() {
+        info!("Available {} ports:", t);
+        for (i, p) in io.ports().iter().enumerate() {
+            if let Ok(name) = io.port_name(p) {
+                info!("[{}] {}", i, name);
+            }
+        }
     }
+
+    ret
 }
 
-pub fn get_logue_device() -> Result<Device> {
+pub fn get_logue_device(
+    input_name: &Option<String>,
+    output_name: &Option<String>,
+) -> Result<Device> {
     let mut midi_input =
         MidiInput::new(CLIENT_IDENTIFICATION).map_err(|e| Error::DeviceCommunicationError {
             source: Box::new(e),
         })?;
     midi_input.ignore(midir::Ignore::Time);
-    let input_port =
-        get_matching_device(&midi_input).map_err(|e| Error::DeviceCommunicationError {
+    let input_port = get_matching_device("input", &midi_input, input_name).map_err(|e| {
+        Error::DeviceCommunicationError {
             source: Box::new(e),
-        })?;
+        }
+    })?;
     let (send, recv) = mpsc::channel::<Vec<u8>>();
     let input_conn = midi_input
         .connect(
@@ -163,7 +188,7 @@ pub fn get_logue_device() -> Result<Device> {
         MidiOutput::new(CLIENT_IDENTIFICATION).map_err(|e| Error::DeviceCommunicationError {
             source: Box::new(e),
         })?;
-    let output_port = get_matching_device(&midi_output)?;
+    let output_port = get_matching_device("output", &midi_output, output_name)?;
     let output_conn = midi_output
         .connect(&output_port, MIDI_CONNECTION_IDENTIFICATION)
         .map_err(|e| Error::DeviceCommunicationError {
