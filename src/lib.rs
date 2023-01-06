@@ -496,7 +496,7 @@ mod json_manifest {
     use serde::Deserialize;
 
     #[derive(Debug, Eq, PartialEq, Deserialize)]
-    pub struct Param(pub String, pub u8, pub u8, pub String);
+    pub struct Param(pub String, pub i8, pub i8, pub String);
 
     #[derive(Debug, Eq, PartialEq, Deserialize)]
     pub struct Header {
@@ -520,8 +520,8 @@ mod json_manifest {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ModuleParam {
     pub name: String,
-    pub min: u8,
-    pub max: u8,
+    pub min: i8,
+    pub max: i8,
     pub is_percentage: bool,
 }
 
@@ -562,8 +562,16 @@ impl ModuleManifest {
             });
         }
         for p in self.params.into_iter() {
-            let unit: u8 = if p.is_percentage { 0 } else { 2 };
-            ret.extend([p.min, p.max, unit]);
+            let unit: u8 = if p.is_percentage {
+                if p.min < 0 || p.max < 0 {
+                    1 // Signed Percent
+                } else {
+                    0 // Unsigned Percent
+                }
+            } else {
+                2 // Signed, no unit
+            };
+            ret.extend([p.min as u8, p.max as u8, unit]);
             ret.extend(string_to_padded_sz(p.name, 13));
         } // [36..36+16*num_param)
 
