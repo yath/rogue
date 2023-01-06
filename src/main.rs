@@ -185,25 +185,15 @@ fn do_clear(
         None => return Err("--module must be specified".into()),
         Some(m) => m,
     };
-    let slots = if let Some(s) = slot {
-        s..s + 1
+    if let Some(s) = slot {
+        dev.clear_user_slot(did, module, s)?;
     } else {
         if !all {
             return Err("Either a slot or -a/--all must be specified".into());
         }
 
-        // Could also use Clear User Module (0x1d)..
-        match dev.user_module_info(did, module)? {
-            None => return Err(format!("no information for module {}", module).into()),
-            Some(info) => 0..info.available_slot_count,
-        }
-    };
-
-    for slot in slots {
-        info!("Clearing {} slot {}...", module, slot);
-        dev.clear_user_slot(did, module, slot)?;
+        dev.clear_user_module(did, module)?;
     }
-    info!("Done.");
     Ok(())
 }
 

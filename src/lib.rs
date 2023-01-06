@@ -1086,6 +1086,20 @@ impl Device {
         debug!("Clear user slot reply: {:x?}", p);
         Ok(())
     }
+
+    pub fn clear_user_module(
+        &mut self,
+        did: &DeviceIdentity,
+        module: UserModuleType,
+    ) -> Result<()> {
+        self.send_korg_sysex(
+            did,
+            &[KorgSysexType::ClearUserModuleRequest as u8, module as u8],
+        )?;
+        let p = self.recv_korg_sysex(did, KorgSysexType::OperationCompleted)?;
+        debug!("Clear user module reply: {:x?}", p);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
