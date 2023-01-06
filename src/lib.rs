@@ -569,7 +569,7 @@ impl ModuleManifest {
                     0 // Unsigned Percent
                 }
             } else {
-                2 // Signed, no unit
+                2 // Signed, no unit, displayed as value+1
             };
             ret.extend([p.min as u8, p.max as u8, unit]);
             ret.extend(string_to_padded_sz(p.name, 13));
