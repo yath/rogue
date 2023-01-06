@@ -8,9 +8,7 @@ a clone of
 
 ```
 $ rustup update  # Debian’s rust is too old :(, use https://rustup.rs/
-$ git clone https://github.com/yath/rogue
-$ cd rogue
-$ cargo install --path .
+$ cargo install --git https://github.com/yath/rogue
 $ rogue probe
 ```
 
