@@ -126,7 +126,15 @@ fn do_load(
         }
     }
 
-    // TODO: check API version
+    if let Ok(api) = dev.user_api_version(did) {
+        info!("Device API: {}", api);
+        if api != pkg.manifest.api {
+            warn!(
+                "Requested API {} does not match device API {}",
+                pkg.manifest.api, api
+            );
+        }
+    }
 
     let mm = pkg.manifest.module;
     let module = match module {
