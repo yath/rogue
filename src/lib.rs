@@ -670,6 +670,7 @@ impl ModulePackage {
                 Some(f) => f,
             };
 
+            debug!("Processing unit file {:?}", filename.file_name());
             match filename.file_name() {
                 Some(f) if f.to_str() == Some("payload.bin") => {
                     if payload.is_some() {

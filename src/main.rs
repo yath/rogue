@@ -128,10 +128,10 @@ fn do_load(
 
     if let Ok(api) = dev.user_api_version(did) {
         info!("Device API: {}", api);
-        if api != pkg.manifest.api {
+        if api.version != pkg.manifest.api.version {
             warn!(
                 "Requested API {} does not match device API {}",
-                pkg.manifest.api, api
+                pkg.manifest.api.version, api.version
             );
         }
     }
