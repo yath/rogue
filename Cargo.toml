@@ -4,11 +4,16 @@ description = "A command-line client for Korg Logue devices"
 version = "0.1.0"
 authors = ["Sebastian Schmidt <yath@yath.de>"]
 repository = "https://github.com/yath/rogue"
+homepage = "https://github.com/yath/rogue"
+documentation = "https://github.com/yath/rogue"
+keywords = ["cli", "logue", "prologue", "minilogue", "nts-1", "nutekt", "korg"]
+categories = ["command-line-utilities"]
 license = "GPL-2.0-only"
 edition = "2021"
 readme = "README.md"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[badges]
+maintenance = { status = "passively-maintained" }
 
 [patch.crates-io]
 midir = { git = "https://github.com/yath/midir", branch = "direct-output-0.8.0" }
