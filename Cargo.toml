@@ -6,6 +6,7 @@ authors = ["Sebastian Schmidt <yath@yath.de>"]
 repository = "https://github.com/yath/rogue"
 license = "GPL-2.0-only"
 edition = "2021"
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
