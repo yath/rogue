@@ -588,7 +588,7 @@ impl ModuleManifest {
         }
         for p in self.params.into_iter() {
             let unit: u8 = if p.is_percentage {
-                #[warn(clippy::bool_to_int_with_if)]
+                #[allow(clippy::bool_to_int_with_if)]
                 if p.min < 0 || p.max < 0 {
                     1 // Signed Percent
                 } else {
