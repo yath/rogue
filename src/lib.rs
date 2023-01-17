@@ -112,7 +112,7 @@ fn get_matching_device<T: MidiIO>(
         .enumerate()
         .filter(|(index, port)| match io.port_name(port) {
             Err(e) => {
-                eprintln!("Error looking up {} port: {}", t, e);
+                warn!("Error looking up {} port: {}", t, e);
                 false
             }
             Ok(p) => match name_or_index {
