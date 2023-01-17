@@ -1,11 +1,10 @@
-use byteorder::{LittleEndian, ReadBytesExt};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use byteorder::{ReadBytesExt, LE};
 use crc::{Crc, CRC_32_ISO_HDLC};
 use log::{debug, info, warn};
 use midir::{MidiIO, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use regex::Regex;
-use snafu::prelude::*;
 use std::{
-    error,
     fmt::{self, Display},
     fs::File,
     io::{self, Cursor, ErrorKind, Read},
@@ -21,8 +20,6 @@ use zip::ZipArchive;
 static CLIENT_IDENTIFICATION: &str = "rogue";
 static MIDI_CONNECTION_IDENTIFICATION: &str = "rogue connection";
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-type Result<T> = std::result::Result<T, Error>;
 
 fn undo_7bitize(input: &[u8]) -> Vec<u8> {
     let mut n_chunks = input.len() / 8;
@@ -93,18 +90,9 @@ fn string_to_padded_sz(s: String, l: usize) -> Vec<u8> {
 
 fn check_empty(mut c: io::Cursor<&[u8]>) -> Result<()> {
     let mut buf: Vec<u8> = Vec::new();
-    c.read_to_end(&mut buf).context(DeviceReadIOContext {})?;
-
-    if buf.is_empty() {
-        Ok(())
-    } else {
-        DeviceResponseParseContext {
-            message: "buffer not empty",
-            offset: None,
-            buf,
-        }
-        .fail()
-    }
+    c.read_to_end(&mut buf)?;
+    ensure!(buf.is_empty(), "buffer not empty: {:x?}", buf);
+    Ok(())
 }
 
 fn get_matching_device<T: MidiIO>(
@@ -132,15 +120,9 @@ fn get_matching_device<T: MidiIO>(
         .collect::<Vec<T::Port>>();
 
     let ret = match matching_ports.len() {
-        0 => DeviceDiscoveryContext {
-            message: format!("no matching {} device found", t),
-        }
-        .fail(),
+        0 => Err(anyhow!("no matching {} device found", t)),
         1 => Ok(matching_ports.swap_remove(0)),
-        _ => DeviceDiscoveryContext {
-            message: format!("more than one matching {} device found", t),
-        }
-        .fail(),
+        _ => Err(anyhow!("more than one matching {} device found", t)),
     };
 
     if ret.is_err() {
@@ -159,16 +141,9 @@ pub fn get_logue_device(
     input_name: &Option<String>,
     output_name: &Option<String>,
 ) -> Result<Device> {
-    let mut midi_input =
-        MidiInput::new(CLIENT_IDENTIFICATION).map_err(|e| Error::DeviceCommunicationError {
-            source: Box::new(e),
-        })?;
+    let mut midi_input = MidiInput::new(CLIENT_IDENTIFICATION)?;
     midi_input.ignore(midir::Ignore::Time);
-    let input_port = get_matching_device("input", &midi_input, input_name).map_err(|e| {
-        Error::DeviceCommunicationError {
-            source: Box::new(e),
-        }
-    })?;
+    let input_port = get_matching_device("input", &midi_input, input_name)?;
     let (send, recv) = mpsc::channel::<Vec<u8>>();
     let input_conn = midi_input
         .connect(
@@ -180,72 +155,19 @@ pub fn get_logue_device(
             },
             (),
         )
-        .map_err(|e| Error::DeviceCommunicationError {
-            source: Box::new(e),
-        })?;
+        .map_err(|e| anyhow!("Can't connect to MIDI input: {}", e))?;
 
-    let midi_output =
-        MidiOutput::new(CLIENT_IDENTIFICATION).map_err(|e| Error::DeviceCommunicationError {
-            source: Box::new(e),
-        })?;
+    let midi_output = MidiOutput::new(CLIENT_IDENTIFICATION)?;
     let output_port = get_matching_device("output", &midi_output, output_name)?;
     let output_conn = midi_output
         .connect(&output_port, MIDI_CONNECTION_IDENTIFICATION)
-        .map_err(|e| Error::DeviceCommunicationError {
-            source: Box::new(e),
-        })?;
+        .map_err(|e| anyhow!("Can't connect to MIDI output: {}", e))?;
 
     Ok(Device {
         _input: input_conn,
         input_channel: recv,
         output: output_conn,
     })
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(context(suffix(Context)))]
-pub enum Error {
-    #[snafu(display(
-        "Could not parse response from device at offset 0x{offset:x?}: {message}. Data: {buf:x?}"
-    ))]
-    DeviceResponseParseError {
-        message: String,
-        offset: Option<usize>,
-        buf: Vec<u8>,
-    },
-
-    #[snafu(display("Unable to read from device: {source}"))]
-    DeviceReadIOError { source: io::Error },
-
-    #[snafu(display("Timeout waiting for response from device: {source}"))]
-    DeviceReadTimeout { source: mpsc::RecvTimeoutError },
-
-    #[snafu(display("Unable to communicate with device: {source}"))]
-    DeviceCommunicationError {
-        #[snafu(source(from(midir::SendError, Box::new)))]
-        source: Box<dyn error::Error>,
-    },
-
-    #[snafu(display("Could not parse manifest: {message}"))]
-    InvalidManifestError { message: String },
-
-    #[snafu(display("Could not deserialize manifest: {source}"))]
-    ManifestSerdeError { source: serde_json::Error },
-
-    #[snafu(display("Could not read from manifest's {filename}: {source}"))]
-    ManifestFileIOError { filename: String, source: io::Error },
-
-    #[snafu(display("Could not read unit file: {source}"))]
-    ManifestIOError { source: io::Error },
-
-    #[snafu(display("Could not unpack unit file: {source}"))]
-    ManifestZIPError { source: zip::result::ZipError },
-
-    #[snafu(display("Payload error: {message}"))]
-    PayloadError { message: String },
-
-    #[snafu(display("Unable to discover device: {message}"))]
-    DeviceDiscoveryError { message: String },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -260,45 +182,27 @@ pub struct DeviceIdentity {
 
 impl DeviceIdentity {
     fn from_repr(msg: &[u8]) -> Result<DeviceIdentity> {
-        if msg.len() != 15 {
-            return DeviceResponseParseContext {
-                message: "invalid length",
-                offset: None,
-                buf: msg,
-            }
-            .fail();
-        }
-
+        ensure!(msg.len() == 15, "invalid length");
         let msg = msg
             .strip_prefix(&[0xf0, 0x7e])
-            .context(DeviceResponseParseContext {
-                message: "invalid prefix, want 0xf0 0x7e",
-                offset: Some(0),
-                buf: msg,
-            })?
+            .ok_or_else(|| anyhow!("invalid prefix, want 0xf0 0x7e: {:x?}", msg))?
             .strip_suffix(&[0xf7])
-            .context(DeviceResponseParseContext {
-                message: "invalid suffix, want 0xf7",
-                offset: Some(msg.len() - 1),
-                buf: msg,
-            })?;
+            .ok_or_else(|| anyhow!("invalid suffix, want 0xf7: {:x?}", msg))?;
 
         let mut c = Cursor::new(msg);
-        let channel = read_u8(&mut c)?;
-        if read_u16_le(&mut c)? != 0x0206 {
-            return DeviceResponseParseContext {
-                message: "invalid message type, want identity reply (0x06 0x02)",
-                offset: Some(2),
-                buf: msg,
-            }
-            .fail();
-        }
-        let manufacturer = read_u8(&mut c)?;
+        let channel = c.read_u8()?;
+        let msgtype = c.read_u16::<LE>()?;
+        ensure!(
+            msgtype == 0x0206,
+            "invalid message type {:x?}, want identity reply (0x06 0x02)",
+            msgtype
+        );
+        let manufacturer = c.read_u8()?;
         if manufacturer != 0x42 {
             warn!("Manufacturer ID 0x{:x} != KORG (0x42)", manufacturer);
         }
-        let (family_id, member_id) = (read_u16_le(&mut c)?, read_u16_le(&mut c)?);
-        let (major_ver, minor_ver) = (read_u16_le(&mut c)?, read_u16_le(&mut c)?);
+        let (family_id, member_id) = (c.read_u16::<LE>()?, c.read_u16::<LE>()?);
+        let (major_ver, minor_ver) = (c.read_u16::<LE>()?, c.read_u16::<LE>()?);
 
         if let Some(dev) = Platform::from_device_family(family_id) {
             info!("Device recognized as {}", dev);
@@ -391,26 +295,12 @@ pub struct UserAPIVersion {
     pub version: Version,
 }
 
-// Reads an u8 from c with io::error converted to Error::DeviceReadIOError.
-fn read_u8(c: &mut io::Cursor<&[u8]>) -> Result<u8> {
-    c.read_u8().context(DeviceReadIOContext {})
-}
-
-// Reads a little-endian u16 from c with io::error converted to Error::DeviceReadIOError.
-fn read_u16_le(c: &mut io::Cursor<&[u8]>) -> Result<u16> {
-    c.read_u16::<LittleEndian>().context(DeviceReadIOContext {})
-}
-// Reads a little-endian u32 from c with io::error converted to Error::DeviceReadIOError.
-fn read_u32_le(c: &mut io::Cursor<&[u8]>) -> Result<u32> {
-    c.read_u32::<LittleEndian>().context(DeviceReadIOContext {})
-}
-
 impl UserAPIVersion {
     fn from_repr(msg: &[u8]) -> Result<Self> {
         let mut c = io::Cursor::new(msg);
         let ret = UserAPIVersion {
-            platform: Platform::from_repr(read_u8(&mut c)?).unwrap_or(Platform::Unknown),
-            version: Version(read_u8(&mut c)?, read_u8(&mut c)?, read_u8(&mut c)?),
+            platform: Platform::from_repr(c.read_u8()?).unwrap_or(Platform::Unknown),
+            version: Version(c.read_u8()?, c.read_u8()?, c.read_u8()?),
         };
         check_empty(c)?;
         Ok(ret)
@@ -445,41 +335,29 @@ pub struct UserSlotStatus {
 impl UserSlotStatus {
     fn from_repr(msg: &[u8]) -> Result<Option<Self>> {
         let mut c = Cursor::new(msg);
-        let (module_type, slot) = (read_u8(&mut c)?, read_u8(&mut c)?); // [0,2)
-        let unk1: u8 = match read_u8(&mut c) {
+        let (module_type, slot) = (c.read_u8()?, c.read_u8()?); // [0,2)
+        let unk1: u8 = match c.read_u8() {
             Ok(b) => b,
-            Err(Error::DeviceReadIOError { source })
-                if source.kind() == ErrorKind::UnexpectedEof =>
-            {
-                return Ok(None)
-            }
-            Err(e) => return Err(e),
+            Err(source) if source.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
         }; // [2,3)
 
         // Remaining data is "7-bit-ized".
         let msg = undo_7bitize(remaining_slice(&c));
         let mut c = Cursor::new(msg.as_ref());
 
-        let (module_type2, platform_id) = (read_u8(&mut c)?, read_u8(&mut c)?); // [0,2)
-        let (api_patch, api_minor, api_major, unk2) = (
-            read_u8(&mut c)?,
-            read_u8(&mut c)?,
-            read_u8(&mut c)?,
-            read_u8(&mut c)?,
-        ); // [2,6)
-        let (did, uid) = (read_u32_le(&mut c)?, read_u32_le(&mut c)?); // [6,14)
-        let (mod_patch, mod_minor, mod_major, unk3) = (
-            read_u8(&mut c)?,
-            read_u8(&mut c)?,
-            read_u8(&mut c)?,
-            read_u8(&mut c)?,
-        ); // [14,18)
+        let (module_type2, platform_id) = (c.read_u8()?, c.read_u8()?); // [0,2)
+        let (api_patch, api_minor, api_major, unk2) =
+            (c.read_u8()?, c.read_u8()?, c.read_u8()?, c.read_u8()?); // [2,6)
+        let (did, uid) = (c.read_u32::<LE>()?, c.read_u32::<LE>()?); // [6,14)
+        let (mod_patch, mod_minor, mod_major, unk3) =
+            (c.read_u8()?, c.read_u8()?, c.read_u8()?, c.read_u8()?); // [14,18)
 
         let mut name0 = [0; 14];
-        c.read_exact(&mut name0).context(DeviceReadIOContext)?; // [18..32)
+        c.read_exact(&mut name0)?; // [18..32)
         let name = string_from_sz(&name0);
 
-        let nparams = read_u8(&mut c)?;
+        let nparams = c.read_u8()?;
         let unk4 = remaining_slice(&c).to_vec();
 
         let ret = UserSlotStatus {
@@ -564,8 +442,7 @@ pub struct ModuleManifest {
 
 impl ModuleManifest {
     pub fn from_reader<R: Read>(r: R) -> Result<Self> {
-        let j: json_manifest::Manifest =
-            serde_json::from_reader(r).context(ManifestSerdeContext)?;
+        let j: json_manifest::Manifest = serde_json::from_reader(r)?;
         ModuleManifest::try_from(j)
     }
 
@@ -577,15 +454,12 @@ impl ModuleManifest {
         ret.extend(self.program_version.as_repr()); // [14..18)
         ret.extend(string_to_padded_sz(self.name, 14)); // [18..32)
         ret.extend((self.num_params as u32).to_le_bytes()); // [32..36)
-        if self.num_params as usize != self.params.len() {
-            return Err(Error::InvalidManifestError {
-                message: format!(
-                    "num_param ({}) does not match number of params ({})",
-                    self.num_params,
-                    self.params.len()
-                ),
-            });
-        }
+        ensure!(
+            self.num_params as usize == self.params.len(),
+            "manifest error: num_param ({}) does not match number of params ({})",
+            self.num_params,
+            self.params.len()
+        );
         for p in self.params.into_iter() {
             let unit: u8 = if p.is_percentage {
                 #[allow(clippy::bool_to_int_with_if)]
@@ -606,44 +480,26 @@ impl ModuleManifest {
 }
 
 impl TryFrom<json_manifest::Manifest> for ModuleManifest {
-    type Error = Error;
+    type Error = anyhow::Error;
 
     fn try_from(j: json_manifest::Manifest) -> Result<Self> {
         Ok(Self {
             api: UserAPIVersion {
                 platform: match Platform::from_str(&j.header.platform) {
-                    Err(e) => {
-                        return InvalidManifestContext {
-                            message: format!("Unknown platform {} ({})", &j.header.platform, e),
-                        }
-                        .fail()
-                    }
+                    Err(e) => bail!("Unknown platform {} ({})", &j.header.platform, e),
                     Ok(p) => p,
                 },
                 version: match Version::from_str(&j.header.api) {
-                    None => {
-                        return InvalidManifestContext {
-                            message: format!("Unable to parse API version {}", &j.header.api),
-                        }
-                        .fail()
-                    }
+                    None => bail!("Unable to parse API version {}", &j.header.api),
                     Some(v) => v,
                 },
             },
-            module: UserModuleType::from_str(&j.header.module).map_err(|err| {
-                Error::InvalidManifestError {
-                    message: format!("can't parse module {}: {}", j.header.module, err),
-                }
-            })?,
+            module: UserModuleType::from_str(&j.header.module)
+                .with_context(|| format!("can't parse module {}", j.header.module))?,
             developer_id: j.header.dev_id,
             program_id: j.header.prg_id,
             program_version: match Version::from_str(j.header.version.as_ref()) {
-                None => {
-                    return InvalidManifestContext {
-                        message: format!("can't parse program version {}", j.header.version),
-                    }
-                    .fail()
-                }
+                None => bail!("can't parse program version {}", j.header.version),
                 Some(v) => v,
             },
             name: j.header.name,
@@ -679,12 +535,11 @@ pub struct ModulePackage {
 
 impl ModulePackage {
     pub fn from_file(path: &Path) -> Result<Self> {
-        let mut zip = ZipArchive::new(File::open(path).context(ManifestIOContext)?)
-            .context(ManifestZIPContext)?;
+        let mut zip = ZipArchive::new(File::open(path)?)?;
         let mut payload: Option<Vec<u8>> = None;
         let mut manifest: Option<ModuleManifest> = None;
         for i in 0..zip.len() {
-            let mut file = zip.by_index(i).context(ManifestZIPContext)?;
+            let mut file = zip.by_index(i)?;
             if !file.is_file() {
                 continue;
             }
@@ -699,25 +554,13 @@ impl ModulePackage {
             debug!("Processing unit file {:?}", filename.file_name());
             match filename.file_name() {
                 Some(f) if f.to_str() == Some("payload.bin") => {
-                    if payload.is_some() {
-                        return InvalidManifestContext {
-                            message: "duplicate payload.bin",
-                        }
-                        .fail();
-                    }
+                    ensure!(payload.is_none(), "duplicate payload.bin");
                     let mut buf = Vec::with_capacity(file.size() as usize);
-                    file.read_to_end(&mut buf).context(ManifestFileIOContext {
-                        filename: "payload.bin",
-                    })?;
+                    file.read_to_end(&mut buf)?;
                     payload = Some(buf);
                 }
                 Some(f) if f.to_str() == Some("manifest.json") => {
-                    if manifest.is_some() {
-                        return InvalidManifestContext {
-                            message: "duplicate manifest.json",
-                        }
-                        .fail();
-                    }
+                    ensure!(manifest.is_none(), "duplicate manifest.json");
                     let m = ModuleManifest::from_reader(file)?;
                     manifest = Some(m);
                 }
@@ -726,15 +569,9 @@ impl ModulePackage {
         }
 
         match (manifest, payload) {
-            (Some(_), None) => Err(Error::InvalidManifestError {
-                message: "no payload.bin found".into(),
-            }),
-            (None, Some(_)) => Err(Error::InvalidManifestError {
-                message: "no manifest.json found".into(),
-            }),
-            (None, None) => Err(Error::InvalidManifestError {
-                message: "no manifest.json and no payload.bin found".into(),
-            }),
+            (Some(_), None) => Err(anyhow!("no payload.bin found")),
+            (None, Some(_)) => Err(anyhow!("no manifest.json found")),
+            (None, None) => Err(anyhow!("no manifest.json and no payload.bin found")),
             (Some(m), Some(p)) => {
                 let ret = ModulePackage {
                     payload: p,
@@ -747,37 +584,26 @@ impl ModulePackage {
     }
 
     fn identify_payload(&self) -> Result<UserModuleType> {
-        let magic = read_u32_le(&mut Cursor::new(&self.payload))?;
+        let magic = Cursor::new(&self.payload).read_u32::<LE>()?;
         match magic {
             0x43534f55 => Ok(UserModuleType::Oscillator), // {'U','O','S','C'}
             0x4c454455 => Ok(UserModuleType::Delay),      // {'U','D','E','L'}
             0x444f4d55 => Ok(UserModuleType::Modulation), // {'U','M','O','D'}
             0x56455255 => Ok(UserModuleType::Reverb),     // {'U','R','E','V'}
-            _ => PayloadContext {
-                message: format!("Unknown magic 0x{:x}", magic),
-            }
-            .fail(),
+            _ => Err(anyhow!("Unknown magic 0x{:x}", magic)),
         }
     }
 
     pub fn validate(&self) -> Result<()> {
         let m = &self.manifest;
-        if m.module == UserModuleType::Unknown {
-            return InvalidManifestContext {
-                message: "Module type unknown",
-            }
-            .fail();
-        }
+        ensure!(m.module != UserModuleType::Unknown, "Module type unknown");
         let payload_type = self.identify_payload()?;
-        if m.module != payload_type {
-            return InvalidManifestContext {
-                message: format!(
-                    "Module specified in manifest ({}) does not match payload type ({})",
-                    m.module, payload_type
-                ),
-            }
-            .fail();
-        }
+        ensure!(
+            m.module == payload_type,
+            "Module specified in manifest ({}) does not match payload type ({})",
+            m.module,
+            payload_type
+        );
         Ok(())
     }
 
@@ -870,9 +696,9 @@ impl UserModuleInfo {
         let mut c = Cursor::new(msg.as_ref());
         Ok(Some(UserModuleInfo {
             module: UserModuleType::from_repr(module).unwrap_or(UserModuleType::Unknown),
-            max_program_size: read_u32_le(&mut c)?,
-            max_load_size: read_u32_le(&mut c)?,
-            available_slot_count: read_u8(&mut c)?,
+            max_program_size: c.read_u32::<LE>()?,
+            max_load_size: c.read_u32::<LE>()?,
+            available_slot_count: c.read_u8()?,
             unknown: UserModuleInfoUnknownFields(unk1, remaining_slice(&c).to_vec()),
         }))
     }
@@ -929,9 +755,7 @@ pub struct Device {
 
 impl Device {
     fn read(&self) -> Result<Vec<u8>> {
-        self.input_channel
-            .recv_timeout(READ_TIMEOUT)
-            .context(DeviceReadTimeoutContext)
+        Ok(self.input_channel.recv_timeout(READ_TIMEOUT)?)
     }
 
     pub fn identify(&mut self) -> Result<DeviceIdentity> {
@@ -944,7 +768,7 @@ impl Device {
             MidiConstants::EndOfSysex as u8,
         ];
         debug!("Sending: {:x?}", msg);
-        self.output.send(msg).context(DeviceCommunicationContext)?;
+        self.output.send(msg)?;
 
         let msg = self.read()?;
         DeviceIdentity::from_repr(msg.as_slice())
@@ -964,7 +788,7 @@ impl Device {
         msg.extend_from_slice(&[MidiConstants::EndOfSysex as u8]);
         debug!("Sending: {:x?}", msg);
 
-        self.output.send(&msg).context(DeviceCommunicationContext)?;
+        self.output.send(&msg)?;
         Ok(())
     }
 
@@ -978,23 +802,12 @@ impl Device {
                 channel_byte,
                 0x00,
             ])
-            .with_context(|| DeviceResponseParseContext {
-                message: "unexpected prefix",
-                offset: Some(0),
-                buf: msg.clone(),
-            })?
+            .ok_or_else(|| anyhow!("unexpected prefix: {:x?}", msg))?
             .strip_prefix(did.family_id.to_be_bytes().as_ref()) // Big endian
-            .with_context(|| DeviceResponseParseContext {
-                message: "unexpected family ID",
-                offset: Some(4),
-                buf: msg.clone(),
-            })?
+            .ok_or_else(|| anyhow!("unexpected family ID at offset 0: {:x?}", msg))?
             .strip_suffix(&[0xf7])
-            .with_context(|| DeviceResponseParseContext {
-                message: "unexpected suffix",
-                offset: None,
-                buf: msg.clone(),
-            })?;
+            .ok_or_else(|| anyhow!("unexpected suffix, want 0xf7: {:x?}", msg))?;
+
         match msg.strip_prefix(&[msgtype as u8]) {
             Some(ret) => Ok(Vec::from(ret)),
             None => {
@@ -1008,15 +821,14 @@ impl Device {
                         (b, "<Unknown>")
                     }
                 };
-                DeviceResponseParseContext {
-                    message: format!(
-                        "Unexpected reply: Received {} (0x{:x}), expected {} (0x{:x})",
-                        t, b, msgtype, msgtype as u8
-                    ),
-                    offset: Some(0),
-                    buf: msg,
-                }
-                .fail()
+                Err(anyhow!(
+                    "Unexpected reply: Received {} (0x{:x}), expected {} (0x{:x}): {:x?}",
+                    t,
+                    b,
+                    msgtype,
+                    msgtype as u8,
+                    msg
+                ))
             }
         }
     }
