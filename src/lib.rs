@@ -1,12 +1,14 @@
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use byteorder::{ReadBytesExt, LE};
 use crc::{Crc, CRC_32_ISO_HDLC};
+use lazy_static::lazy_static;
 use log::{debug, info, warn};
 use midir::{MidiIO, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use regex::Regex;
 use std::{
+    cmp,
     fmt::{self, Display},
-    fs::File,
+    fs::{self, File},
     io::{self, Cursor, ErrorKind, Read},
     path::Path,
     str::FromStr,
@@ -18,6 +20,8 @@ use strum_macros::{Display, EnumIter, EnumString, FromRepr, IntoStaticStr};
 use zip::ZipArchive;
 
 static CLIENT_IDENTIFICATION: &str = "rogue";
+static ALSA_OUTPUT_BUFFER_SIZE_PARAM_FILE: &str =
+    "/sys/module/snd_seq_midi/parameters/output_buffer_size";
 static MIDI_CONNECTION_IDENTIFICATION: &str = "rogue connection";
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -753,9 +757,55 @@ pub struct Device {
     output: MidiOutputConnection,
 }
 
+#[cfg(target_os = "linux")]
+fn check_alsa_output_buffer_size(s: usize) {
+    fn read_usize(p: &str) -> Result<usize> {
+        Ok(String::from_utf8(fs::read(p)?)?.trim().parse::<usize>()?)
+    }
+
+    lazy_static! {
+        static ref BUFSIZE: Option<usize> = read_usize(ALSA_OUTPUT_BUFFER_SIZE_PARAM_FILE)
+            .map_or_else(
+                |e| {
+                    debug!("Can't determine ALSA MIDI output buffer size: {}", e);
+                    None
+                },
+                |s| Some(s)
+            );
+    };
+
+    if let Some(bs) = *BUFSIZE {
+        if bs < s {
+            let r = cmp::max(65536, 1 << (usize::BITS - s.leading_zeros()));
+            warn!(
+                "Your ALSA MIDI output buffer ({} bytes) is smaller than sent data ({} bytes)",
+                bs, s
+            );
+            warn!(
+                "Try increasing it with: echo {} | sudo tee {}",
+                r, ALSA_OUTPUT_BUFFER_SIZE_PARAM_FILE
+            );
+            warn!(
+                "or write into /etc/modprobe.conf: options snd-seq-midi output_buffer_size={}",
+                r
+            );
+            warn!("if you are receiving timeouts.");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_alsa_output_buffer_size(_: usize) {}
+
 impl Device {
     fn read(&self) -> Result<Vec<u8>> {
         Ok(self.input_channel.recv_timeout(READ_TIMEOUT)?)
+    }
+
+    fn send(&mut self, msg: &[u8]) -> Result<()> {
+        debug!("Sending: {:x?}", msg);
+        check_alsa_output_buffer_size(msg.len());
+        Ok(self.output.send(msg)?)
     }
 
     pub fn identify(&mut self) -> Result<DeviceIdentity> {
@@ -767,8 +817,7 @@ impl Device {
             0x01, // Identity request
             MidiConstants::EndOfSysex as u8,
         ];
-        debug!("Sending: {:x?}", msg);
-        self.output.send(msg)?;
+        self.send(msg)?;
 
         let msg = self.read()?;
         DeviceIdentity::from_repr(msg.as_slice())
@@ -786,9 +835,8 @@ impl Device {
         msg.extend(did.family_id.to_be_bytes()); // Big endian
         msg.extend_from_slice(payload);
         msg.extend_from_slice(&[MidiConstants::EndOfSysex as u8]);
-        debug!("Sending: {:x?}", msg);
 
-        self.output.send(&msg)?;
+        self.send(&msg)?;
         Ok(())
     }
 

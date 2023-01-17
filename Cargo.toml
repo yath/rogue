@@ -23,6 +23,7 @@ anyhow = "1.0.68"
 byteorder = "1.4.3"
 clap = { version = "4.0.32", features = ["derive"] }
 crc = "3.0.0"
+lazy_static = "1.4.0"
 log = "0.4.17"
 midir = "0.8.0"
 regex = { version = "1.7.0", default-features = false, features = ["std", "unicode-perl"] }
