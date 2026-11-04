@@ -66,6 +66,34 @@ $ rogue load -m Oscillator -s 0 -u better.prlgunit
 
 See `rogue help` for more details.
 
+## NTS-3 kaoss pad
+
+The NTS-3 takes logue SDK 2 units (`.nts3unit`), which are plain ELF files rather than
+zipped packages. It has a single module type, `genericfx` (alias `fx`), with 50 slots.
+
+```
+$ rogue probe
+$ rogue load -u drone.nts3unit
+$ rogue load -u drone.nts3unit -s 3
+```
+
+SysEx goes through the `NTS-3 kaoss pad kit XY/KNOB` input and `NTS-3 kaoss pad kit SOUND`
+output; rogue picks those over the `MIDI IN`/`MIDI OUT` (DIN jack) ports by itself.
+
+The protocol was worked out by capturing what KORG KONTROL Editor sends, then checked
+against an NTS-3 running firmware 1.1:
+
+* Upload: the unit is sent as `UserSlotData` (`0x4a`) messages of at most 4096 bytes:
+  `F0 42 3c 00 01 72 4A <module> <slot> <chunk> <last chunk> <7-bit data> F7`. The data,
+  joined across chunks, is the file size (32-bit LE), a zero word, then the file itself.
+  Each chunk is 7-bit-ized separately. The device answers each chunk with
+  `OperationCompleted` (`0x23`).
+* Slot status: `UserSlotDataRequest` (`0x1a`) returns the unit in the same chunked format.
+  An empty slot answers with a single chunk without data (`4A <module> <slot> 00 00`).
+  The NTS-3 interleaves MIDI clock (`F8`) bytes with the SysEx data, which rogue strips.
+* `clear` with a slot (`ClearUserSlotRequest`, `0x1b`) works as on the older devices.
+  `clear -a` (`ClearUserModuleRequest`, `0x1d`) hasn't been tried.
+
 ## License
 
 GPL 2.0 (only).

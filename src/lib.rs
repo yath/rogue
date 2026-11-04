@@ -24,6 +24,9 @@ static ALSA_OUTPUT_BUFFER_SIZE_PARAM_FILE: &str =
     "/sys/module/snd_seq_midi/parameters/output_buffer_size";
 static MIDI_CONNECTION_IDENTIFICATION: &str = "rogue connection";
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+// Raw bytes per UserSlotData chunk on logue SDK 2 devices, as sent by KORG's editor: 3573
+// bytes 7-bit-ize to 4084, which with the 11-byte header and 0xf7 is a 4096-byte message.
+const SLOT_DATA_CHUNK_SIZE: usize = 3573;
 
 fn undo_7bitize(input: &[u8]) -> Vec<u8> {
     let mut n_chunks = input.len() / 8;
@@ -104,7 +107,7 @@ fn get_matching_device<T: MidiIO>(
     io: &T,
     name_or_index: &Option<String>,
 ) -> Result<T::Port> {
-    let known_prefixes = vec!["prologue", "prol.dev", "minilogue", "nutekt", "NTS-1"];
+    let known_prefixes = vec!["prologue", "prol.dev", "minilogue", "nutekt", "NTS-1", "NTS-3"];
 
     let mut matching_ports = io
         .ports()
@@ -122,6 +125,22 @@ fn get_matching_device<T: MidiIO>(
         })
         .map(|(_, port)| port)
         .collect::<Vec<T::Port>>();
+
+    // Devices like the NTS-3 also expose their MIDI jacks as ports; SysEx goes through the
+    // "... KBD/KNOB" (or "XY/KNOB") input and the "... SOUND" output.
+    if name_or_index.is_none() && matching_ports.len() > 1 {
+        let preferred = matching_ports
+            .iter()
+            .filter(|port| {
+                io.port_name(port)
+                    .is_ok_and(|p| p.ends_with("KNOB") || p.ends_with("SOUND"))
+            })
+            .cloned()
+            .collect::<Vec<T::Port>>();
+        if !preferred.is_empty() {
+            matching_ports = preferred;
+        }
+    }
 
     let ret = match matching_ports.len() {
         0 => Err(anyhow!("no matching {} device found", t)),
@@ -278,6 +297,8 @@ pub enum Platform {
     MinilogueXD = 0x2,
     #[strum(to_string = "nutekt digital", serialize = "nutekt-digital")]
     NutektDigital = 0x3,
+    #[strum(to_string = "NTS-3 kaoss pad", serialize = "nts-3", serialize = "nts3")]
+    Nts3Kaoss = 0x6,
     #[strum(disabled)]
     Unknown = 0xff,
 }
@@ -288,6 +309,29 @@ impl Platform {
             0x14b => Some(Self::Prologue),
             0x151 | 0x12c => Some(Self::MinilogueXD), // disassembly says 0x151, doc says 0x12c
             0x157 => Some(Self::NutektDigital),
+            0x172 => Some(Self::Nts3Kaoss),
+            _ => None,
+        }
+    }
+
+    /// Whether the platform takes logue SDK 2 units (plain ELF files, chunked upload) rather
+    /// than zipped manifest + payload packages.
+    pub fn uses_elf_units(&self) -> bool {
+        matches!(self, Self::Nts3Kaoss)
+    }
+
+    /// User modules available on the platform.
+    pub fn modules(&self) -> Vec<UserModuleType> {
+        match self {
+            Self::Nts3Kaoss => vec![UserModuleType::GenericFx],
+            _ => UserModuleType::variants(),
+        }
+    }
+
+    /// Slot count for platforms that don't answer UserModuleInfoRequest.
+    pub fn fixed_slot_count(&self, module: UserModuleType) -> Option<u8> {
+        match (self, module) {
+            (Self::Nts3Kaoss, UserModuleType::GenericFx) => Some(50),
             _ => None,
         }
     }
@@ -625,6 +669,168 @@ impl ModulePackage {
     }
 }
 
+/// The parts of a logue SDK 2 `unit_header_t` that rogue cares about.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct UnitHeader {
+    pub platform: Platform,
+    pub module: UserModuleType,
+    pub api: Version,
+    pub developer_id: u32,
+    pub unit_id: u32,
+    pub version: Version,
+    pub name: String,
+    pub num_params: u32,
+}
+
+impl UnitHeader {
+    fn from_repr(hdr: &[u8]) -> Result<Self> {
+        // SDK 2 versions are packed as (major << 16) | (minor << 8) | patch.
+        fn version(v: u32) -> Version {
+            Version((v >> 16) as u8, (v >> 8) as u8, v as u8)
+        }
+
+        let mut c = Cursor::new(hdr);
+        let (_header_size, target, api) = (
+            c.read_u32::<LE>()?,
+            c.read_u32::<LE>()?,
+            c.read_u32::<LE>()?,
+        ); // [0,12)
+        let (dev_id, unit_id, ver) = (
+            c.read_u32::<LE>()?,
+            c.read_u32::<LE>()?,
+            c.read_u32::<LE>()?,
+        ); // [12,24)
+        let mut name = [0; 20];
+        c.read_exact(&mut name)?; // [24,44)
+        let (_reserved0, _reserved1) = (c.read_u32::<LE>()?, c.read_u32::<LE>()?); // [44,52)
+        let num_params = c.read_u32::<LE>()?; // [52,56)
+
+        Ok(UnitHeader {
+            platform: Platform::from_repr((target >> 8) as u8 & 0x7f).unwrap_or(Platform::Unknown),
+            module: UserModuleType::from_repr(target as u8 & 0x7f)
+                .unwrap_or(UserModuleType::Unknown),
+            api: version(api),
+            developer_id: dev_id,
+            unit_id,
+            version: version(ver),
+            name: string_from_sz(&name),
+            num_params,
+        })
+    }
+}
+
+impl Display for UnitHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "\"{name}\" {version} {module} API {api} did:{did:08X} uid:{uid:08X}",
+            name = self.name,
+            version = self.version,
+            module = self.module,
+            api = self.api,
+            did = self.developer_id,
+            uid = self.unit_id
+        )
+    }
+}
+
+/// A logue SDK 2 unit (e.g. `.nts3unit`): an ARM ELF shared object with a `.unit_header`
+/// section. The device takes the file as is.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ElfUnit {
+    pub header: UnitHeader,
+    pub data: Vec<u8>,
+}
+
+impl ElfUnit {
+    pub fn is_elf_file(path: &Path) -> Result<bool> {
+        let mut magic = [0; 4];
+        match File::open(path)?.read_exact(&mut magic) {
+            Ok(()) => Ok(&magic == b"\x7fELF"),
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn from_file(path: &Path) -> Result<Self> {
+        Self::from_bytes(fs::read(path)?)
+    }
+
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
+        ensure!(data.starts_with(b"\x7fELF"), "not an ELF file");
+        ensure!(
+            data.get(4) == Some(&1) && data.get(5) == Some(&1),
+            "not a 32-bit little endian ELF file"
+        );
+        let hdr = elf32_section(&data, ".unit_header")?
+            .ok_or_else(|| anyhow!("no .unit_header section"))?;
+        let header = UnitHeader::from_repr(hdr).context("can't parse .unit_header")?;
+        Ok(ElfUnit { header, data })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.header.platform != Platform::Unknown,
+            "Platform unknown"
+        );
+        ensure!(
+            self.header.module != UserModuleType::Unknown,
+            "Module type unknown"
+        );
+        Ok(())
+    }
+
+    /// Payload of a chunked UserSlotData transfer: size, a zero word, then the file.
+    fn into_repr(self) -> Vec<u8> {
+        let mut ret = Vec::with_capacity(self.data.len() + 8);
+        ret.extend((self.data.len() as u32).to_le_bytes());
+        ret.extend(0u32.to_le_bytes()); // Always zero from KORG's editor; meaning unknown.
+        ret.extend(self.data);
+        ret
+    }
+
+    fn from_repr(msg: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(msg);
+        let (size, _unk) = (c.read_u32::<LE>()? as usize, c.read_u32::<LE>()?);
+        let data = remaining_slice(&c);
+        ensure!(
+            data.len() >= size,
+            "slot data shorter ({}) than its size field ({})",
+            data.len(),
+            size
+        );
+        Self::from_bytes(data[..size].to_vec())
+    }
+}
+
+/// Returns the contents of the named section of a 32-bit little endian ELF file.
+fn elf32_section<'a>(elf: &'a [u8], name: &str) -> Result<Option<&'a [u8]>> {
+    let get = move |off: usize, len: usize| {
+        elf.get(off..off + len)
+            .ok_or_else(|| anyhow!("ELF file truncated at 0x{:x}", off))
+    };
+    let u16_at = |off| -> Result<usize> { Ok(Cursor::new(get(off, 2)?).read_u16::<LE>()? as usize) };
+    let u32_at = |off| -> Result<usize> { Ok(Cursor::new(get(off, 4)?).read_u32::<LE>()? as usize) };
+
+    let (shoff, shentsize) = (u32_at(0x20)?, u16_at(0x2e)?);
+    let (shnum, shstrndx) = (u16_at(0x30)?, u16_at(0x32)?);
+    // Section header fields: sh_name at 0x0, sh_offset at 0x10, sh_size at 0x14.
+    let section = |i: usize| -> Result<(usize, usize, usize)> {
+        let sh = shoff + i * shentsize;
+        Ok((u32_at(sh)?, u32_at(sh + 0x10)?, u32_at(sh + 0x14)?))
+    };
+    let (_, strtab, strtab_size) = section(shstrndx)?;
+    let strtab = get(strtab, strtab_size)?;
+
+    for i in 0..shnum {
+        let (name_off, off, size) = section(i)?;
+        if strtab.get(name_off..).map(string_from_sz).as_deref() == Some(name) {
+            return Ok(Some(get(off, size)?));
+        }
+    }
+    Ok(None)
+}
+
 #[repr(u8)]
 enum MidiConstants {
     Sysex = 0xf0,
@@ -664,14 +870,24 @@ pub enum UserModuleType {
     #[strum(to_string = "Oscillator", serialize = "osc")]
     Oscillator = 4,
 
+    #[strum(to_string = "Synth", serialize = "synth")]
+    Synth = 5,
+
+    #[strum(to_string = "MasterFX", serialize = "masterfx")]
+    MasterFx = 6,
+
+    #[strum(to_string = "GenericFX", serialize = "genericfx", serialize = "fx")]
+    GenericFx = 7,
+
     #[strum(disabled)]
     Unknown = 0xff,
 }
 
 impl UserModuleType {
+    /// Modules of the original logue SDK platforms (prologue, minilogue xd, NTS-1).
     pub fn variants() -> Vec<UserModuleType> {
         Self::iter()
-            .filter(|t| *t != Self::Global && *t != Self::Unknown)
+            .filter(|t| matches!(t, Self::Modulation | Self::Delay | Self::Reverb | Self::Oscillator))
             .collect()
     }
 }
@@ -799,7 +1015,15 @@ fn check_alsa_output_buffer_size(_: usize) {}
 
 impl Device {
     fn read(&self) -> Result<Vec<u8>> {
-        Ok(self.input_channel.recv_timeout(READ_TIMEOUT)?)
+        loop {
+            let mut msg = self.input_channel.recv_timeout(READ_TIMEOUT)?;
+            // System real-time messages (e.g. the NTS-3's MIDI clock) may arrive on their own
+            // or be interleaved with SysEx data bytes.
+            msg.retain(|b| *b < 0xf8);
+            if !msg.is_empty() {
+                return Ok(msg);
+            }
+        }
     }
 
     fn send(&mut self, msg: &[u8]) -> Result<()> {
@@ -952,6 +1176,77 @@ impl Device {
         debug!("Upload reply: {:x?}", p);
 
         Ok(())
+    }
+
+    /// Uploads a logue SDK 2 unit. The payload is split into chunks, each sent as
+    /// UserSlotData <module> <slot> <chunk index> <last chunk index> <7-bit data> and
+    /// acknowledged by the device before the next one is sent.
+    pub fn upload_elf_unit(
+        &mut self,
+        did: &DeviceIdentity,
+        module: UserModuleType,
+        slot: u8,
+        unit: ElfUnit,
+    ) -> Result<()> {
+        let payload = unit.into_repr();
+        let chunks: Vec<&[u8]> = payload.chunks(SLOT_DATA_CHUNK_SIZE).collect();
+        ensure!(chunks.len() <= 0x80, "unit too large ({} bytes)", payload.len());
+        let last = (chunks.len() - 1) as u8;
+        info!("payload size: {}, {} chunks", payload.len(), chunks.len());
+
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let mut buf = vec![KorgSysexType::UserSlotData as u8, module as u8, slot, i as u8, last];
+            buf.extend(do_7bitize(chunk));
+            self.send_korg_sysex(did, &buf)?;
+            let p = self
+                .recv_korg_sysex(did, KorgSysexType::OperationCompleted)
+                .with_context(|| format!("uploading chunk {} of {}", i, last))?;
+            debug!("Chunk {} reply: {:x?}", i, p);
+        }
+
+        Ok(())
+    }
+
+    /// Reads back a logue SDK 2 unit with UserSlotDataRequest, the way KORG's editor checks
+    /// slots. Returns None if the slot is empty.
+    pub fn read_elf_unit(
+        &mut self,
+        did: &DeviceIdentity,
+        module: UserModuleType,
+        slot: u8,
+    ) -> Result<Option<ElfUnit>> {
+        self.send_korg_sysex(
+            did,
+            &[KorgSysexType::UserSlotDataRequest as u8, module as u8, slot],
+        )?;
+
+        let mut data = Vec::new();
+        for i in 0u8.. {
+            let p = self.recv_korg_sysex(did, KorgSysexType::UserSlotData)?;
+            ensure!(
+                p.len() >= 2 && p[0] == module as u8 && p[1] == slot,
+                "slot data for the wrong slot: {:x?}",
+                &p[..cmp::min(p.len(), 4)]
+            );
+            if p.len() == 2 {
+                // Just <module> <slot>: also treated as an empty slot.
+                ensure!(i == 0, "empty chunk {} in slot data", i);
+                return Ok(None);
+            }
+            ensure!(p.len() >= 4, "short slot data message: {:x?}", p);
+            let (index, last) = (p[2], p[3]);
+            ensure!(index == i, "got slot data chunk {}, expected {}", index, i);
+            data.extend(undo_7bitize(&p[4..]));
+            if index == last {
+                break;
+            }
+        }
+
+        if data.is_empty() {
+            // The NTS-3 answers an empty slot with a single chunk without data.
+            return Ok(None);
+        }
+        Ok(Some(ElfUnit::from_repr(&data)?))
     }
 
     pub fn clear_user_slot(
@@ -1124,6 +1419,93 @@ mod tests {
                 unknown: UserModuleInfoUnknownFields(0, vec![0, 0, 0])
             })
         );
+    }
+
+    /// Builds a minimal 32-bit LE ELF file with a single .unit_header section.
+    fn fake_elf_unit(unit_header: &[u8]) -> Vec<u8> {
+        let shstrtab = b"\0.unit_header\0.shstrtab\0";
+        let (hdr_off, strtab_off) = (0x34, 0x34 + unit_header.len());
+        let shoff = strtab_off + shstrtab.len();
+
+        let mut elf = vec![0u8; 0x34];
+        elf[..6].copy_from_slice(b"\x7fELF\x01\x01");
+        elf[0x20..0x24].copy_from_slice(&(shoff as u32).to_le_bytes());
+        elf[0x2e..0x30].copy_from_slice(&40u16.to_le_bytes()); // e_shentsize
+        elf[0x30..0x32].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
+        elf[0x32..0x34].copy_from_slice(&2u16.to_le_bytes()); // e_shstrndx
+        elf.extend(unit_header);
+        elf.extend(shstrtab);
+        for (name, off, size) in [
+            (0u32, 0usize, 0usize),
+            (1, hdr_off, unit_header.len()),
+            (14, strtab_off, shstrtab.len()),
+        ] {
+            let mut sh = [0u8; 40];
+            sh[0..4].copy_from_slice(&name.to_le_bytes());
+            sh[0x10..0x14].copy_from_slice(&(off as u32).to_le_bytes());
+            sh[0x14..0x18].copy_from_slice(&(size as u32).to_le_bytes());
+            elf.extend(sh);
+        }
+        elf
+    }
+
+    fn nts3_unit_header() -> Vec<u8> {
+        let mut h = Vec::new();
+        for v in [0x2f0u32, 0x607, 0x20000, 0x12345678, 0x9abcdef0, 0x10203] {
+            h.extend(v.to_le_bytes());
+        }
+        h.extend(string_to_padded_sz("drone".to_string(), 20));
+        for v in [0u32, 0, 4] {
+            h.extend(v.to_le_bytes());
+        }
+        h
+    }
+
+    #[test]
+    fn test_elf_unit() {
+        let elf = fake_elf_unit(&nts3_unit_header());
+        let unit = ElfUnit::from_bytes(elf.clone()).unwrap();
+        assert_eq!(
+            unit.header,
+            UnitHeader {
+                platform: Platform::Nts3Kaoss,
+                module: UserModuleType::GenericFx,
+                api: Version(2, 0, 0),
+                developer_id: 0x12345678,
+                unit_id: 0x9abcdef0,
+                version: Version(1, 2, 3),
+                name: "drone".to_string(),
+                num_params: 4,
+            }
+        );
+        unit.validate().unwrap();
+        assert_eq!(unit.data, elf);
+
+        assert!(ElfUnit::from_bytes(b"PK\x03\x04".to_vec()).is_err());
+        assert!(ElfUnit::from_bytes(fake_elf_unit(&[0; 8])).is_err()); // short header
+    }
+
+    #[test]
+    fn test_elf_unit_payload() {
+        let elf = fake_elf_unit(&nts3_unit_header());
+        let unit = ElfUnit::from_bytes(elf.clone()).unwrap();
+        let repr = unit.clone().into_repr();
+        assert_eq!(repr[..4], (elf.len() as u32).to_le_bytes());
+        assert_eq!(repr[4..8], [0; 4]);
+        assert_eq!(repr[8..], elf[..]);
+
+        // Trailing bytes after the size are ignored when reading back.
+        let mut padded = repr.clone();
+        padded.extend([0; 5]);
+        assert_eq!(ElfUnit::from_repr(&padded).unwrap(), unit);
+        assert!(ElfUnit::from_repr(&repr[..repr.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn test_slot_data_chunk_size() {
+        // F0 42 3c 00 01 72 4A module slot index last <data> F7 must be 4096 bytes, as sent
+        // by KORG's editor.
+        assert_eq!(11 + do_7bitize(&[0; SLOT_DATA_CHUNK_SIZE]).len() + 1, 4096);
     }
 
     #[test]

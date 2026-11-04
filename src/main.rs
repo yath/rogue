@@ -19,7 +19,7 @@ struct Cli {
     #[arg(short = 'o', long, global = true)]
     output_device: Option<String>,
 
-    /// Module type (modfx, delfx, revfx, osc)
+    /// Module type (modfx, delfx, revfx, osc, genericfx)
     #[arg(short = 'm', long, global = true)]
     module_type: Option<rogue::UserModuleType>,
 
@@ -57,6 +57,38 @@ enum Commands {
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+fn uses_elf_units(did: &rogue::DeviceIdentity) -> bool {
+    did.platform().is_some_and(|p| p.uses_elf_units())
+}
+
+/// Returns the slot count of a module, with a description of the module if the device has one.
+fn module_slots(
+    dev: &mut rogue::Device,
+    did: &rogue::DeviceIdentity,
+    module: rogue::UserModuleType,
+) -> Result<Option<(u8, String)>> {
+    if let Some(n) = did.platform().and_then(|p| p.fixed_slot_count(module)) {
+        return Ok(Some((n, format!("{}: {} slots", module, n))));
+    }
+    Ok(dev
+        .user_module_info(did, module)?
+        .map(|info| (info.available_slot_count, info.to_string())))
+}
+
+/// Returns a description of the unit in a slot, or None if the slot is empty.
+fn slot_status(
+    dev: &mut rogue::Device,
+    did: &rogue::DeviceIdentity,
+    module: rogue::UserModuleType,
+    slot: u8,
+) -> Result<Option<String>> {
+    if uses_elf_units(did) {
+        Ok(dev.read_elf_unit(did, module, slot)?.map(|u| u.header.to_string()))
+    } else {
+        Ok(dev.user_slot_status(did, module, slot)?.map(|s| s.to_string()))
+    }
+}
+
 fn do_probe(
     dev: &mut rogue::Device,
     did: &rogue::DeviceIdentity,
@@ -64,31 +96,27 @@ fn do_probe(
 ) -> Result<()> {
     let modules = match module {
         Some(x) => vec![x],
-        None => UserModuleType::variants(),
+        None => did
+            .platform()
+            .map_or_else(UserModuleType::variants, |p| p.modules()),
     };
     for module in modules {
-        let info = dev.user_module_info(did, module)?;
-        let info = match info {
+        let slots = match module_slots(dev, did, module)? {
             None => {
                 println!("No information for module {:?}", module);
                 continue;
             }
-            Some(info) => {
+            Some((slots, info)) => {
                 println!("\n>>> {:?} [ {} ]", module, info);
-                info
+                slots
             }
         };
 
-        for slot in 0..info.available_slot_count {
-            let slot_info = dev.user_slot_status(did, module, slot)?;
-            let slot_info = match slot_info {
-                None => {
-                    println!("[{}]: empty", slot);
-                    continue;
-                }
-                Some(slot_info) => slot_info,
-            };
-            println!("[{}] {}", slot, slot_info);
+        for slot in 0..slots {
+            match slot_status(dev, did, module, slot)? {
+                None => println!("[{}]: empty", slot),
+                Some(status) => println!("[{}] {}", slot, status),
+            }
         }
     }
     Ok(())
@@ -99,20 +127,69 @@ fn find_first_free_slot(
     did: &rogue::DeviceIdentity,
     module: rogue::UserModuleType,
 ) -> Result<u8> {
-    let info = dev.user_module_info(did, module)?;
-    let info = match info {
-        Some(i) => i,
+    let slots = match module_slots(dev, did, module)? {
+        Some((slots, _)) => slots,
         None => return Err(format!("no information for module {}", module).into()),
     };
 
-    for slot in 0..info.available_slot_count {
-        let slot_info = dev.user_slot_status(did, module, slot)?;
-        if slot_info.is_none() {
+    for slot in 0..slots {
+        if slot_status(dev, did, module, slot)?.is_none() {
             return Ok(slot);
         }
     }
 
     Err(format!("No free slot for module {} found", module).into())
+}
+
+fn do_load_elf(
+    dev: &mut rogue::Device,
+    did: &rogue::DeviceIdentity,
+    module: Option<rogue::UserModuleType>,
+    slot: Option<u8>,
+    filename: &Path,
+) -> Result<()> {
+    let unit = rogue::ElfUnit::from_file(filename)?;
+    unit.validate()?;
+    info!("Unit: {}", unit.header);
+
+    if let Some(platform) = did.platform() {
+        if platform != unit.header.platform {
+            warn!(
+                "Device {} does not match target platform {}",
+                platform, unit.header.platform
+            );
+        }
+    }
+
+    let um = unit.header.module;
+    let module = match module {
+        Some(m) => m,
+        None => {
+            info!("No -m option set, inferred module type {}", um);
+            um
+        }
+    };
+
+    if module != um {
+        warn!(
+            "Requested module type {} does not match unit type {}",
+            module, um
+        )
+    }
+
+    let slot = match slot {
+        Some(s) => s,
+        None => {
+            info!("Finding a free slot...");
+            let s = find_first_free_slot(dev, did, module)?;
+            info!("No -s option set, using first free slot {}", s);
+            s
+        }
+    };
+
+    dev.upload_elf_unit(did, module, slot, unit)?;
+    info!("Upload successful");
+    Ok(())
 }
 
 fn do_load(
@@ -122,6 +199,10 @@ fn do_load(
     slot: Option<u8>,
     filename: &Path,
 ) -> Result<()> {
+    if rogue::ElfUnit::is_elf_file(filename)? {
+        return do_load_elf(dev, did, module, slot, filename);
+    }
+
     let pkg = rogue::ModulePackage::from_file(filename)?;
     pkg.validate()?;
 
@@ -176,6 +257,13 @@ fn do_load(
 }
 
 fn do_check(filename: &Path) -> Result<()> {
+    if rogue::ElfUnit::is_elf_file(filename)? {
+        let unit = rogue::ElfUnit::from_file(filename)?;
+        unit.validate()?;
+        info!("Looks good, parsed unit header:\n{:#x?}", unit.header);
+        return Ok(());
+    }
+
     let pkg = rogue::ModulePackage::from_file(filename)?;
     pkg.validate()?;
     info!("Looks good, parsed manifest:\n{:#x?}", pkg.manifest);
